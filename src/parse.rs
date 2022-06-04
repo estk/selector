@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use syn::parse::{Parse, ParseStream};
 use syn::{Arm, Expr, ExprAwait, Ident, Pat, Token};
 
@@ -9,22 +11,30 @@ mod kw {
 pub struct Select {
     // span of `complete`, then expression after `=> ...`
     default: Option<Expr>,
-    cases: Vec<CaseKind>,
     random: bool,
+    futs: Vec<(ExprAwait, Option<Expr>, Range<usize>)>,
+    arms: Vec<(Pat, Box<Expr>)>,
 }
-
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug)]
-enum CaseKind {
+impl Select {
+    pub fn fut_count(&self) -> usize {
+        self.futs.len()
+    }
+    pub fn case_count(&self) -> usize {
+        if self.default.is_some() {
+            self.futs.len() + 1
+        } else {
+            self.futs.len()
+        }
+    }
+}
+enum Partial {
     Default(Expr),
     Normal {
-        pat: Option<Pat>,
         futs: Vec<(ExprAwait, Option<Expr>)>,
-        body: Option<Expr>,
+        pat: Option<Pat>,
     },
     Match {
         futs: Vec<(ExprAwait, Option<Expr>)>,
-        arms: Vec<Arm>,
     },
 }
 
@@ -32,8 +42,9 @@ impl Parse for Select {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         let mut select = Self {
             default: None,
-            cases: vec![],
             random: true,
+            futs: vec![],
+            arms: vec![],
         };
 
         if input.peek(kw::biased) {
@@ -42,7 +53,7 @@ impl Parse for Select {
         }
 
         while !input.is_empty() {
-            let mut case_kind = if input.peek(Token![default]) {
+            let partial = if input.peek(Token![default]) {
                 // `default`
                 if select.default.is_some() {
                     return Err(input.error("multiple default cases found, only one allowed"));
@@ -50,7 +61,7 @@ impl Parse for Select {
                 input.parse::<Ident>()?;
                 input.parse::<Token![=>]>()?;
                 let expr = input.parse::<Expr>()?;
-                CaseKind::Default(expr)
+                Partial::Default(expr)
             } else {
                 let pat = if input.peek2(Token![=]) {
                     // `<pat> = <fut1>.await [if <bool>], <fut2>.await [if <bool>], ... =>`
@@ -80,11 +91,7 @@ impl Parse for Select {
                     };
                     futs.push((fut, cond));
                 }
-                CaseKind::Normal {
-                    pat,
-                    futs,
-                    body: None,
-                }
+                Partial::Normal { futs, pat }
             };
             if input.peek(Token![=>]) {
                 // `=> <expr>`
@@ -105,18 +112,23 @@ impl Parse for Select {
                 } else {
                     input.parse::<Token![,]>()?;
                 }
-                if let CaseKind::Normal { body, .. } = &mut case_kind {
-                    body.replace(expr);
+
+                if let Partial::Normal {
+                    futs,
+                    pat: Some(pat),
+                } = partial
+                {
+                    select.arms.push((pat, Box::new(expr)));
+                    let i = select.arms.len();
+                    let iter = futs.drain(..).map(|(fut, cond)| (fut, cond, i..i + 1));
+                    select.futs.extend(&mut iter)
+                } else if let Partial::Default(expr) = partial {
+                    select.default.replace(expr);
                 } else {
                     panic!("unreachable")
                 }
             } else if input.peek(syn::token::Brace) {
-                if let CaseKind::Normal {
-                    pat: None,
-                    futs,
-                    body: None,
-                } = case_kind
-                {
+                if let Partial::Normal { pat: None, futs } = partial {
                     let arms_pb;
                     syn::braced!(arms_pb in input);
                     let mut arms: Vec<Arm> = vec![];
@@ -126,17 +138,19 @@ impl Parse for Select {
                     }
 
                     input.parse::<Option<Token![,]>>()?;
-                    case_kind = CaseKind::Match { futs, arms }
+
+                    let arm_iter = arms.drain(..).map(|a| (a.pat, a.body));
+                    let i = select.arms.len();
+                    select.arms.extend(arm_iter);
+                    let j = select.arms.len();
+
+                    let fut_iter = futs.drain(..).map(|(fut, cond)| (fut, cond, i..j));
+                    select.futs.extend(fut_iter);
                 } else {
                     panic!("A case may not have both a singular pattern and a match block")
                 }
             } else {
                 panic!("Invalid syntax, ExprAwait and condition must be followed by either a Brace or `=>`")
-            }
-
-            match case_kind {
-                CaseKind::Default(expr) => select.default = Some(expr),
-                _ => select.cases.push(case_kind),
             }
         }
 
