@@ -1,40 +1,17 @@
-use std::ops::Range;
-
 use syn::parse::{Parse, ParseStream};
 use syn::{Arm, Expr, ExprAwait, Ident, Pat, Token};
+
+use super::Select;
 
 mod kw {
     syn::custom_keyword!(biased);
 }
 
-#[derive(Debug)]
-pub struct Select {
-    // span of `complete`, then expression after `=> ...`
-    default: Option<Expr>,
-    random: bool,
-    futs: Vec<(ExprAwait, Option<Expr>, Range<usize>)>,
-    arms: Vec<(Pat, Box<Expr>)>,
-}
-impl Select {
-    pub fn fut_count(&self) -> usize {
-        self.futs.len()
-    }
-    pub fn case_count(&self) -> usize {
-        if self.default.is_some() {
-            self.futs.len() + 1
-        } else {
-            self.futs.len()
-        }
-    }
-}
 enum Partial {
     Default(Expr),
     Normal {
         futs: Vec<(ExprAwait, Option<Expr>)>,
         pat: Option<Pat>,
-    },
-    Match {
-        futs: Vec<(ExprAwait, Option<Expr>)>,
     },
 }
 
@@ -114,13 +91,13 @@ impl Parse for Select {
                 }
 
                 if let Partial::Normal {
-                    futs,
+                    mut futs,
                     pat: Some(pat),
                 } = partial
                 {
                     select.arms.push((pat, Box::new(expr)));
-                    let i = select.arms.len();
-                    let iter = futs.drain(..).map(|(fut, cond)| (fut, cond, i..i + 1));
+                    let i = select.arms.len() - 1;
+                    let mut iter = futs.drain(..).map(|(fut, cond)| (fut, cond, i..i + 1));
                     select.futs.extend(&mut iter)
                 } else if let Partial::Default(expr) = partial {
                     select.default.replace(expr);
@@ -128,7 +105,11 @@ impl Parse for Select {
                     panic!("unreachable")
                 }
             } else if input.peek(syn::token::Brace) {
-                if let Partial::Normal { pat: None, futs } = partial {
+                if let Partial::Normal {
+                    pat: None,
+                    mut futs,
+                } = partial
+                {
                     let arms_pb;
                     syn::braced!(arms_pb in input);
                     let mut arms: Vec<Arm> = vec![];

@@ -1,63 +1,142 @@
-use proc_macro::{TokenStream, TokenTree};
+use std::ops::Range;
+
+use proc_macro::TokenStream;
 use proc_macro2::Span;
+use quote::format_ident;
 use quote::quote;
-use syn::{parse_quote, Ident};
+use syn::{Ident, Pat};
 
 use crate::Select;
+impl Select {
+    fn render_conds(&self) -> Vec<proc_macro2::TokenStream> {
+        let mut res = Vec::with_capacity(self.futs.len());
+        for (i, (_, cond, _)) in self.futs.iter().enumerate() {
+            // only include conditions that are defined
+            // todo(eas): we could probably statically eliminate literals here too...
+            if let Some(c) = cond {
+                res.push(proc_macro2::TokenStream::from(quote! {
+                    if #c {
+                        let mask: __tokio_select_util::Mask = 1 << #i;
+                        disabled |= mask;
+                    }
+                }));
+            }
+        }
+        res
+    }
+    fn render_futs_tup(&self) -> proc_macro2::TokenStream {
+        let futs = self.futs.iter().map(|(f, _, _)| f.base.clone());
+        proc_macro2::TokenStream::from(quote! {
+            (#(#futs,)*)
+        })
+    }
+
+    fn mk_start(&self) -> proc_macro2::TokenStream {
+        if self.random {
+            proc_macro2::TokenStream::from(quote! {
+                ::tokio::macros::support::thread_rng_n(FUTURES)
+            })
+        } else {
+            proc_macro2::TokenStream::from(quote! {
+                0
+            })
+        }
+    }
+    fn fut_ids(&self) -> Vec<u32> {
+        self.futs
+            .iter()
+            .enumerate()
+            .map(|(i, _)| i as u32)
+            .collect()
+    }
+    fn mk_matches(&self) -> Vec<proc_macro2::TokenStream> {
+        let rs: Vec<Range<usize>> = self.futs.iter().map(|(_, _, r)| r).cloned().collect();
+
+        let mut res = vec![];
+        for r in rs {
+            let arms: &[(Pat, Box<syn::Expr>)] = &self.arms[r];
+            let pats: Vec<Pat> = arms
+                .iter()
+                .map(|(p, _)| {
+                    let mut pp = p.clone();
+                    clean_pattern(&mut pp);
+                    pp
+                })
+                .collect();
+            res.push(proc_macro2::TokenStream::from(quote! {
+                // The future returned a value, check if matches
+                // the specified pattern.
+                #[allow(unused_variables)]
+                #[allow(unused_mut)]
+                match &out {
+                    #(
+                        #pats => {}
+                    )*
+                    _ => continue,
+                }
+            }));
+        }
+        res
+    }
+}
 
 pub(crate) fn render(parsed: Select) -> TokenStream {
     let span = Span::call_site();
-    let fut_count = parsed.fut_count();
-    let case_count = parsed.case_count();
+    let fut_count = parsed.fut_count() as u32;
 
     let enum_item = declare_output_enum(parsed.fut_count(), span);
+    let rendered_conds = parsed.render_conds();
+    let rendered_futs_tup = parsed.render_futs_tup();
+    let start = parsed.mk_start();
+    let fut_ids = parsed.fut_ids();
+    let fut_ids_pfx: Vec<_> = parsed
+        .fut_ids()
+        .iter()
+        .map(|id| format_ident!("N{}", id))
+        .collect();
+    let matches = parsed.mk_matches();
 
     TokenStream::from(quote! { {
         #enum_item
 
         // `tokio::macros::support` is a public, but doc(hidden) module
         // including a re-export of all types needed by this macro.
-        use $crate::macros::support::Future;
-        use $crate::macros::support::Pin;
-        use $crate::macros::support::Poll::{Ready, Pending};
+        use ::tokio::macros::support::Future;
+        use ::tokio::macros::support::Pin;
+        use ::tokio::macros::support::Poll::{Ready, Pending};
 
-        const FUTURES: u32 = select.branches;
+        const FUTURES: u32 = #fut_count;
 
         let mut disabled: __tokio_select_util::Mask = Default::default();
 
-        // First, invoke all the pre-conditions. For any that return true,
-        // set the appropriate bit in `disabled`.
-        for (i, c) in parsed.conds.enumerate() {
-                // todo(eas): idx right?
-            let mask: __tokio_select_util::Mask = 1 << i;
-            disabled |= mask;
-        }
+        #(
+            // First, invoke all the pre-conditions. For any that return true,
+            // set the appropriate bit in `disabled`.
+            #rendered_conds
+        )*
 
         let mut output = {
-            let futures = ( #( #fut, )+ );
-            $crate::macros::support::poll_fn(|cx| {
+            let mut futures = #rendered_futs_tup;
+            ::tokio::macros::support::poll_fn(|cx| {
                 let mut is_pending = false;
 
                 // Choose a starting index to begin polling the futures at. In
                 // practice, this will either be a pseudo-randomly generated
                 // number by default, or the constant 0 if `biased;` is
                 // supplied.
-                let start = if parsed.biased {
-                    0;
-                } else {
-                    $crate::macros::support::thread_rng_n(FUTURES)
-                };
+                let start = #start;
 
+                // The inner polling loop
                 for i in 0..FUTURES {
-                    let branch;
+
                     #[allow(clippy::modulo_one)]
-                    {
-                        branch = (start + i) % FUTURES;
-                    }
+                    let branch = {
+                        (start + i) % FUTURES
+                    };
                     match branch {
                         #[allow(unreachable_code)]
                         #(
-                             #fut_idx => {
+                                #fut_ids => {
                                 // First, if the future has previously been
                                 // disabled, do not poll it again. This is done
                                 // by checking the associated bit in the
@@ -71,7 +150,7 @@ pub(crate) fn render(parsed: Select) -> TokenStream {
 
                                 // Extract the future for this branch from the
                                 // tuple
-                                let fut = &mut futures.#fut_idx;
+                                let fut = &mut futures.#fut_ids;
 
                                 // Safety: future is stored on the stack above
                                 // and never moved.
@@ -91,31 +170,30 @@ pub(crate) fn render(parsed: Select) -> TokenStream {
                                 // Disable the future from future polling.
                                 disabled |= mask;
 
-                                // The future returned a value, check if matches
-                                // the specified pattern.
-                                #[allow(unused_variables)]
-                                #[allow(unused_mut)]
-                                match &out {
-                                    $crate::select_priv_clean_pattern!(#bind) => {}
-                                    _ => continue,
-                                }
-
-                                // The select is complete, return the value
-                                return Ready(format_ident!("__tokio_select_util::Out::_{}({})", #fut_idx, out))
+                                #matches
+                                return Ready(__tokio_select_util::Out::#fut_ids_pfx(out))
                             }
-                         )*
-                        }
+                            )*
+                            _ => unreachable!()
                     }
-            });
+                }
+                if is_pending {
+                    Pending
+                } else {
+                    Ready(__tokio_select_util::Out::Disabled)
+                }
+            }).await
         };
-
-        #output
-    } })
+        match output {
+            _ => println!("matched")
+        }
+    }
+    })
 }
 
-pub(crate) fn declare_output_enum(branches: usize, span: Span) -> TokenStream {
+pub(crate) fn declare_output_enum(branches: usize, span: Span) -> proc_macro2::TokenStream {
     let variants = (0..branches)
-        .map(|num| Ident::new(&format!("_{}", num), span))
+        .map(|num| Ident::new(&format!("N{}", num), span))
         .collect::<Vec<_>>();
 
     // Use a bitfield to track which futures completed
@@ -134,7 +212,7 @@ pub(crate) fn declare_output_enum(branches: usize, span: Span) -> TokenStream {
         span,
     );
 
-    TokenStream::from(quote! {
+    proc_macro2::TokenStream::from(quote! {
         mod __tokio_select_util {
             pub(super) enum Out<#( #variants ),*> {
                 #( #variants(#variants), )*
@@ -146,19 +224,6 @@ pub(crate) fn declare_output_enum(branches: usize, span: Span) -> TokenStream {
             pub(super) type Mask = #mask;
         }
     })
-}
-
-pub(crate) fn clean_pattern_macro(input: TokenStream) -> TokenStream {
-    // If this isn't a pattern, we return the token stream as-is. The select!
-    // macro is using it in a location requiring a pattern, so an error will be
-    // emitted there.
-    let mut input: syn::Pat = match syn::parse(input.clone()) {
-        Ok(it) => it,
-        Err(_) => return input,
-    };
-
-    clean_pattern(&mut input);
-    quote::ToTokens::into_token_stream(input).into()
 }
 
 // Removes any occurrences of ref or mut in the provided pattern.
