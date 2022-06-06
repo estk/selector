@@ -26,11 +26,4 @@ impl Select {
     pub fn fut_count(&self) -> usize {
         self.futs.len()
     }
-    pub fn case_count(&self) -> usize {
-        if self.default.is_some() {
-            self.futs.len() + 1
-        } else {
-            self.futs.len()
-        }
-    }
 }

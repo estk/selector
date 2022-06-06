@@ -3,15 +3,6 @@ use selector::select;
 
 #[tokio::test]
 async fn it_works() {
-    let f1 = async { 1 };
-    let f2 = async { 2 };
-    let f3 = async { 3 };
-    let f4 = async { 4 };
-    let f5 = async { 5 };
-    let f6 = async { 6 };
-    let f7 = async { 7 };
-    let f8 = async { 8 };
-    let f9 = async { 9 };
     let f91 = async { 91 };
     let f92 = async { 92 };
     let f10 = async { Ok::<usize, String>(10) };
@@ -21,26 +12,26 @@ async fn it_works() {
         biased;
 
         // ultra shorthand
-        f9.await => _,
+        async { 1 }.await => _,
 
         // shorthand
-        f7.await => 1,
+        async{ 2 }.await => 2,
 
         // shorthand with cond
-        f8.await if true => 1,
+        async { 3 }.await if true => 3,
 
         // normal
-        x = f1.await => x,
+        x = async { 4 }.await => x,
 
         // normal with cond
-        x = f2.await if true => x,
+        x = async { 5 }.await if true => x,
 
         // multiple futures
         // question: should x be `Either`?
-        x = f3.await, f4.await => x,
+        x = async { 6 }.await , async { 7 }.await => x,
 
         // multiple futures with cond
-        x = f5.await if true, f6.await if false => x,
+        x = async { 8 }.await if true, async { 9 }.await if false => x,
 
         // shorthand match
         f10.await {
@@ -56,5 +47,5 @@ async fn it_works() {
         // multiple futures with ultra short
         f91.await, f92.await => _,
     };
-    println!("res: {:?}", res);
+    assert_eq!(res, 1);
 }

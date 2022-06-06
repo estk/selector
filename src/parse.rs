@@ -1,4 +1,3 @@
-use proc_macro2::Span;
 use syn::parse::{Parse, ParseStream};
 use syn::{parse_quote, Arm, Expr, ExprAwait, Ident, Pat, Token};
 
@@ -43,7 +42,7 @@ impl Parse for Select {
                 Partial::Default(expr)
             } else {
                 let pat = if input.peek2(Token![=]) {
-                    // `<pat> = <fut1>.await [if <bool>], <fut2>.await [if <bool>], ... =>`
+                    // `<pat> = <fut1>.await [if <bool>] | <fut2>.await [if <bool>], ... =>`
                     let pat = input.parse::<syn::Pat>()?;
                     input.parse::<Token![=]>()?;
                     Some(pat)
