@@ -50,11 +50,11 @@ impl Select {
             .collect()
     }
     fn mk_matches(&self) -> Vec<proc_macro2::TokenStream> {
-        let rs: Vec<Range<usize>> = self.futs.iter().map(|(_, _, r)| r).cloned().collect();
+        let rs = self.futs.iter().map(|(_, _, r)| r);
 
         let mut res = vec![];
         for r in rs {
-            let arms: &[(Pat, Box<syn::Expr>)] = &self.arms[r];
+            let arms: &[(Pat, Box<syn::Expr>)] = &self.arms[r.clone()];
             let pats: Vec<Pat> = arms
                 .iter()
                 .map(|(p, _)| {
@@ -78,6 +78,24 @@ impl Select {
         }
         res
     }
+    fn mk_bodies(&self) -> Vec<proc_macro2::TokenStream> {
+        let rs = self.futs.iter().enumerate().map(|(i, (_, _, r))| (i, r));
+
+        let mut res = vec![];
+
+        for (fid, r) in rs {
+            let arms: &[(Pat, Box<syn::Expr>)] = &self.arms[r.clone()];
+            let mut temp = vec![];
+            for (p, b) in arms {
+                let variant = format_ident!("N{}", fid);
+                temp.push(proc_macro2::TokenStream::from(quote! {
+                        __tokio_select_util::Out::#variant(#p) => #b,
+                }));
+            }
+            res.extend(temp);
+        }
+        res
+    }
 }
 
 pub(crate) fn render(parsed: Select) -> TokenStream {
@@ -89,12 +107,18 @@ pub(crate) fn render(parsed: Select) -> TokenStream {
     let rendered_futs_tup = parsed.render_futs_tup();
     let start = parsed.mk_start();
     let fut_ids = parsed.fut_ids();
+    let fut_ids_ident: Vec<syn::Index> = parsed
+        .fut_ids()
+        .iter()
+        .map(|id| syn::Index::from(*id as usize))
+        .collect();
     let fut_ids_pfx: Vec<_> = parsed
         .fut_ids()
         .iter()
         .map(|id| format_ident!("N{}", id))
         .collect();
     let matches = parsed.mk_matches();
+    let bodies = parsed.mk_bodies();
 
     TokenStream::from(quote! { {
         #enum_item
@@ -150,7 +174,7 @@ pub(crate) fn render(parsed: Select) -> TokenStream {
 
                                 // Extract the future for this branch from the
                                 // tuple
-                                let fut = &mut futures.#fut_ids;
+                                let fut = &mut futures.#fut_ids_ident;
 
                                 // Safety: future is stored on the stack above
                                 // and never moved.
@@ -185,7 +209,14 @@ pub(crate) fn render(parsed: Select) -> TokenStream {
             }).await
         };
         match output {
-            _ => println!("matched")
+            #(
+                #bodies
+            )*
+            __tokio_select_util::Out::Disabled => {
+               panic!("all branches are disabled and there is no else branch")
+            }
+            _ =>
+                unreachable!("failed to match bind"),
         }
     }
     })

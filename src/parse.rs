@@ -1,5 +1,6 @@
+use proc_macro2::Span;
 use syn::parse::{Parse, ParseStream};
-use syn::{Arm, Expr, ExprAwait, Ident, Pat, Token};
+use syn::{parse_quote, Arm, Expr, ExprAwait, Ident, Pat, Token};
 
 use super::Select;
 
@@ -27,6 +28,7 @@ impl Parse for Select {
         if input.peek(kw::biased) {
             input.parse::<kw::biased>()?;
             input.parse::<Token![;]>()?;
+            select.random = false;
         }
 
         while !input.is_empty() {
@@ -71,13 +73,20 @@ impl Parse for Select {
                 Partial::Normal { futs, pat }
             };
             if input.peek(Token![=>]) {
+                let mut short = false;
                 // `=> <expr>`
                 input.parse::<Token![=>]>()?;
 
                 // todo(eas): ultra shorthand look for Token![_] then pattern against it
                 // need to verify no existing pattern
+                let expr = if input.peek(Token![_]) {
+                    short = true;
+                    input.parse::<Token![_]>()?;
+                    parse_quote!(x)
+                } else {
+                    input.parse::<Expr>()?
+                };
 
-                let expr = input.parse::<Expr>()?;
                 // Commas after the expression are only optional if it's a `Block`
                 // or it is the last branch in the `match`.
                 let is_block = match expr {
@@ -90,19 +99,33 @@ impl Parse for Select {
                     input.parse::<Token![,]>()?;
                 }
 
-                if let Partial::Normal {
-                    mut futs,
-                    pat: Some(pat),
-                } = partial
-                {
-                    select.arms.push((pat, Box::new(expr)));
-                    let i = select.arms.len() - 1;
-                    let mut iter = futs.drain(..).map(|(fut, cond)| (fut, cond, i..i + 1));
-                    select.futs.extend(&mut iter)
-                } else if let Partial::Default(expr) = partial {
-                    select.default.replace(expr);
-                } else {
-                    panic!("unreachable")
+                match partial {
+                    Partial::Normal {
+                        mut futs,
+                        pat: Some(pat),
+                    } => {
+                        select.arms.push((pat, Box::new(expr)));
+                        let i = select.arms.len() - 1;
+                        let mut iter = futs.drain(..).map(|(fut, cond)| (fut, cond, i..i + 1));
+                        select.futs.extend(&mut iter)
+                    }
+                    Partial::Normal {
+                        mut futs,
+                        pat: None,
+                    } => {
+                        let pw = if short {
+                            parse_quote!(x)
+                        } else {
+                            parse_quote!(_)
+                        };
+                        select.arms.push((pw, Box::new(expr)));
+                        let i = select.arms.len() - 1;
+                        let mut iter = futs.drain(..).map(|(fut, cond)| (fut, cond, i..i + 1));
+                        select.futs.extend(&mut iter)
+                    }
+                    Partial::Default(expr) => {
+                        select.default.replace(expr);
+                    }
                 }
             } else if input.peek(syn::token::Brace) {
                 if let Partial::Normal {
