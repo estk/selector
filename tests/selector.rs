@@ -28,7 +28,7 @@ async fn it_works() {
 
         // multiple futures
         // question: should x be `Either`?
-        x = async { 6 }.await , async { 7 }.await => x,
+        x = async { 6 }.await, async { 7 }.await => x,
 
         // multiple futures with cond
         x = async { 8 }.await if true, async { 9 }.await if false => x,
